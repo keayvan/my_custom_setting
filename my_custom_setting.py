@@ -6,7 +6,7 @@ import os
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango
 
 PS = "/sys/class/power_supply"
 BAT = f"{PS}/BAT0"
@@ -106,31 +106,47 @@ def fmt_span(hours):
     return f"{hours:.0f} h" if hours < 48 else f"{hours / 24:.1f} days"
 
 
-class Chart(Gtk.DrawingArea):
-    """Line chart coloured by battery state, with a few horizontal grid lines."""
+class Chart(Gtk.Widget):
+    """Line chart coloured by battery state, with a few horizontal grid lines.
+
+    Drawn with GtkSnapshot/GSK so it needs no extra cairo bindings.
+    """
 
     def __init__(self, unit, fixed_max):
-        super().__init__(content_height=160, hexpand=True,
+        super().__init__(height_request=170, hexpand=True,
                          margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
         self.unit = unit
         self.fixed_max = fixed_max
         self.points = []
-        self.set_draw_func(self.draw)
 
     def set_points(self, points):
         self.points = points
         self.queue_draw()
 
-    def draw(self, _area, cr, width, height):
+    def text(self, snap, label, x, y, color):
+        layout = self.create_pango_layout(label)
+        layout.set_font_description(Pango.FontDescription.from_string("Sans 8"))
+        tw, th = layout.get_pixel_size()
+        snap.save()
+        snap.translate(Graphene.Point().init(x, y - th / 2))
+        snap.append_layout(layout, color)
+        snap.restore()
+        return tw
+
+    def stroke(self, snap, builder, color, width):
+        snap.append_stroke(builder.to_path(), Gsk.Stroke.new(width), color)
+
+    def do_snapshot(self, snap):
+        width, height = self.get_width(), self.get_height()
         fg = self.get_color()
-        left, bottom = 34, 18
-        w, h = width - left - 4, height - bottom - 4
-        cr.select_font_face("Sans")
-        cr.set_font_size(10)
+        dim = fg.copy()
+        dim.alpha = 0.55
+        faint = fg.copy()
+        faint.alpha = 0.12
+        left, bottom = 34, 20
+        w, h = width - left - 6, height - bottom - 8
         if len(self.points) < 2:
-            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.5)
-            cr.move_to(left, height / 2)
-            cr.show_text("Not enough data yet")
+            self.text(snap, "Not enough data yet", left, height / 2, dim)
             return
 
         t0, t1 = self.points[0][0], self.points[-1][0]
@@ -141,35 +157,34 @@ class Chart(Gtk.DrawingArea):
             return left + (t - t0) / max(1, t1 - t0) * w
 
         def y(v):
-            return 4 + h - v / top * h
+            return 8 + h - min(v, top) / top * h
 
+        grid = Gsk.PathBuilder()
         for i in range(5):
             v = top * i / 4
-            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.12)
-            cr.move_to(left, y(v))
-            cr.line_to(left + w, y(v))
-            cr.set_line_width(1)
-            cr.stroke()
-            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.55)
-            cr.move_to(2, y(v) + 3)
-            cr.show_text(f"{v:.0f}")
-        for t in (t0, t1):
+            grid.move_to(left, y(v))
+            grid.line_to(left + w, y(v))
+            self.text(snap, f"{v:.0f}", 2, y(v), dim)
+        self.stroke(snap, grid, faint, 1)
+        for t, align in ((t0, 0), (t1, 1)):
             label = GLib.DateTime.new_from_unix_local(t).format("%a %H:%M")
-            ext = cr.text_extents(label)
-            cr.move_to(min(max(x(t) - ext.width / 2, left), width - ext.width - 2), height - 3)
-            cr.show_text(label)
+            layout = self.create_pango_layout(label)
+            layout.set_font_description(Pango.FontDescription.from_string("Sans 8"))
+            tw = layout.get_pixel_size()[0]
+            self.text(snap, label, left + align * (w - tw), height - 9, dim)
 
-        cr.set_line_width(2)
+        paths = {}
         for (ta, va, sa), (tb, vb, _) in zip(self.points, self.points[1:]):
-            c = Gdk.RGBA()
-            c.parse(COLORS.get(sa, COLORS["other"]))
-            cr.set_source_rgba(c.red, c.green, c.blue, 1)
-            cr.move_to(x(ta), y(va))
+            b = paths.setdefault(COLORS.get(sa, COLORS["other"]), Gsk.PathBuilder())
+            b.move_to(x(ta), y(va))
             # Long gaps mean the laptop was off or asleep: draw them as a step.
             if tb - ta > 1800:
-                cr.line_to(x(tb), y(va))
-            cr.line_to(x(tb), y(vb))
-            cr.stroke()
+                b.line_to(x(tb), y(va))
+            b.line_to(x(tb), y(vb))
+        for color, b in paths.items():
+            c = Gdk.RGBA()
+            c.parse(color)
+            self.stroke(snap, b, c, 2)
 
 
 class Window(Adw.ApplicationWindow):
