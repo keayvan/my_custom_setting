@@ -22,6 +22,13 @@ Charging controls:
 - **Charge to 100% once** runs `tlp fullcharge`: the battery charges fully until the
   next reboot or the next Save.
 
+### History
+
+A **History** sub-tab inside Power draws battery level and power over time,
+coloured by state (charging, on battery, plugged in). Pick how far back to look:
+the last 1, 3, 5 or 10 charges, or everything. The data comes from upower's own
+history in `/var/lib/upower`, which only keeps a few days.
+
 ## Touchscreen tab
 
 A switch that unbinds the touchscreen from the `i2c_hid_acpi` driver to turn it off,

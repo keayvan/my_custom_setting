@@ -6,7 +6,7 @@ import os
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk
 
 PS = "/sys/class/power_supply"
 BAT = f"{PS}/BAT0"
@@ -61,6 +61,117 @@ class Row(Adw.ActionRow):
         self.value.set_label(text)
 
 
+HISTORY_DIR = "/var/lib/upower"
+# (label, number of most recent charges to show; None = everything kept)
+HISTORY_RANGES = [("Last charge", 1), ("Last 3 charges", 3), ("Last 5 charges", 5),
+                  ("Last 10 charges", 10), ("Everything", None)]
+COLORS = {"charging": "#33d17a", "discharging": "#ff7800", "other": "#9a9996"}
+
+
+def load_history(kind):
+    """Read upower's (time, value, state) samples for the laptop battery."""
+    files = [f for f in glob.glob(f"{HISTORY_DIR}/history-{kind}-*.dat")
+             if "generic_id" not in f]
+    if not files:
+        return []
+    points = []
+    with open(max(files, key=os.path.getsize)) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 3 and parts[2] != "unknown":
+                points.append((int(parts[0]), float(parts[1]), parts[2]))
+    return points
+
+
+def charge_sessions(points):
+    """Start times of each run of 'charging' samples."""
+    starts, prev = [], None
+    for t, _, state in points:
+        if state == "charging" and prev != "charging":
+            starts.append(t)
+        prev = state
+    return starts
+
+
+def range_start(points, count):
+    if not points:
+        return 0
+    starts = charge_sessions(points)
+    if count is None or not starts:
+        return points[0][0]
+    return starts[-min(count, len(starts))]
+
+
+def fmt_span(hours):
+    return f"{hours:.0f} h" if hours < 48 else f"{hours / 24:.1f} days"
+
+
+class Chart(Gtk.DrawingArea):
+    """Line chart coloured by battery state, with a few horizontal grid lines."""
+
+    def __init__(self, unit, fixed_max):
+        super().__init__(content_height=160, hexpand=True,
+                         margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+        self.unit = unit
+        self.fixed_max = fixed_max
+        self.points = []
+        self.set_draw_func(self.draw)
+
+    def set_points(self, points):
+        self.points = points
+        self.queue_draw()
+
+    def draw(self, _area, cr, width, height):
+        fg = self.get_color()
+        left, bottom = 34, 18
+        w, h = width - left - 4, height - bottom - 4
+        cr.select_font_face("Sans")
+        cr.set_font_size(10)
+        if len(self.points) < 2:
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.5)
+            cr.move_to(left, height / 2)
+            cr.show_text("Not enough data yet")
+            return
+
+        t0, t1 = self.points[0][0], self.points[-1][0]
+        top = self.fixed_max() if self.fixed_max else \
+            max(5, max(v for _, v, _ in self.points) * 1.1)
+
+        def x(t):
+            return left + (t - t0) / max(1, t1 - t0) * w
+
+        def y(v):
+            return 4 + h - v / top * h
+
+        for i in range(5):
+            v = top * i / 4
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.12)
+            cr.move_to(left, y(v))
+            cr.line_to(left + w, y(v))
+            cr.set_line_width(1)
+            cr.stroke()
+            cr.set_source_rgba(fg.red, fg.green, fg.blue, 0.55)
+            cr.move_to(2, y(v) + 3)
+            cr.show_text(f"{v:.0f}")
+        for t in (t0, t1):
+            label = GLib.DateTime.new_from_unix_local(t).format("%a %H:%M")
+            ext = cr.text_extents(label)
+            cr.move_to(min(max(x(t) - ext.width / 2, left), width - ext.width - 2), height - 3)
+            cr.show_text(label)
+
+        cr.set_line_width(2)
+        for (ta, va, sa), (tb, vb, _) in zip(self.points, self.points[1:]):
+            c = Gdk.RGBA()
+            c.parse(COLORS.get(sa, COLORS["other"]))
+            cr.set_source_rgba(c.red, c.green, c.blue, 1)
+            cr.move_to(x(ta), y(va))
+            # Long gaps mean the laptop was off or asleep: draw them as a step.
+            if tb - ta > 1800:
+                cr.line_to(x(tb), y(va))
+            cr.line_to(x(tb), y(vb))
+            cr.stroke()
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="My Custom Setting")
@@ -68,7 +179,7 @@ class Window(Adw.ApplicationWindow):
         self.set_default_size(440, 680)
 
         stack = Adw.ViewStack()
-        stack.add_titled_with_icon(self.build_power_page(), "power", "Power",
+        stack.add_titled_with_icon(self.build_power_tab(), "power", "Power",
                                    "battery-full-charging-symbolic")
         stack.add_titled_with_icon(self.build_touch_page(), "touch", "Touchscreen",
                                    "input-tablet-symbolic")
@@ -82,6 +193,72 @@ class Window(Adw.ApplicationWindow):
 
         self.refresh()
         GLib.timeout_add_seconds(2, self.refresh)
+
+    def build_power_tab(self):
+        sub = Adw.ViewStack(vexpand=True)
+        sub.add_titled(self.build_power_page(), "now", "Now")
+        sub.add_titled(self.build_history_page(), "history", "History")
+        switcher = Adw.InlineViewSwitcher(stack=sub, halign=Gtk.Align.CENTER,
+                                          margin_top=12)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(switcher)
+        box.append(sub)
+        return box
+
+    def build_history_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                       margin_top=18, margin_bottom=24, margin_start=18, margin_end=18)
+
+        group = Adw.PreferencesGroup()
+        self.range_row = Adw.ComboRow(
+            title="Show",
+            model=Gtk.StringList.new([label for label, _ in HISTORY_RANGES]))
+        self.range_row.set_selected(1)
+        self.range_row.connect("notify::selected", lambda *_: self.refresh_history())
+        self.history_summary = Row("Period")
+        group.add(self.range_row)
+        group.add(self.history_summary)
+        page.append(group)
+
+        self.charge_chart = Chart("Battery (%)", lambda: 100)
+        self.rate_chart = Chart("Power (W)", None)
+        for title, chart in (("Battery level", self.charge_chart),
+                             ("Power", self.rate_chart)):
+            g = Adw.PreferencesGroup(title=title)
+            g.add(chart)
+            page.append(g)
+
+        legend = Gtk.Label(use_markup=True, css_classes=["caption", "dim-label"], label=(
+            f"<span foreground='{COLORS['charging']}'>●</span> Charging   "
+            f"<span foreground='{COLORS['discharging']}'>●</span> On battery   "
+            f"<span foreground='{COLORS['other']}'>●</span> Plugged in, not charging"))
+        page.append(legend)
+        page.append(Gtk.Label(
+            label="From upower's history, which only keeps a few days.",
+            css_classes=["caption", "dim-label"], wrap=True))
+
+        self.refresh_history()
+        GLib.timeout_add_seconds(60, self.refresh_history)
+        return Gtk.ScrolledWindow(child=page, vexpand=True)
+
+    def refresh_history(self):
+        charge = load_history("charge")
+        rate = load_history("rate")
+        _, count = HISTORY_RANGES[self.range_row.get_selected()]
+        start = range_start(charge, count)
+        charge = [p for p in charge if p[0] >= start]
+        rate = [p for p in rate if p[0] >= start]
+        self.charge_chart.set_points(charge)
+        self.rate_chart.set_points(rate)
+        if charge:
+            span = (charge[-1][0] - charge[0][0]) / 3600
+            sessions = len(charge_sessions(charge))
+            since = GLib.DateTime.new_from_unix_local(charge[0][0]).format("%a %H:%M")
+            self.history_summary.set(f"since {since} · {fmt_span(span)} · "
+                                     f"{sessions} charge{'s' if sessions != 1 else ''}")
+        else:
+            self.history_summary.set("No data yet")
+        return True
 
     def build_power_page(self):
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
